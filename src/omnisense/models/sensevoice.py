@@ -127,6 +127,98 @@ class OmniSenseVoiceSmall:
         self.blank_id = 0
 
     @torch.no_grad()
+    def transcribe_single_batch(
+        self,
+        audio: List[np.ndarray],
+        language: Union[str, List[str]] = "auto",
+        textnorm: str = "woitn",
+        sort_by_duration: bool = True,  # kept for backward compatibility, not used
+        batch_size: int = 4,            # kept for backward compatibility, not used
+        timestamps: bool = False,
+        num_workers: int = 0,           # kept for backward compatibility, not used
+        progressbar: bool = True,       # kept for backward compatibility, not used
+    ) -> List[OmniTranscription]:
+        """
+        Transcribe a batch of audio waveforms.
+
+        Parameters
+        ----------
+        audio : List[np.ndarray]
+            List of mono waveform arrays. Each array represents one utterance.
+        language : Union[str, List[str]]
+            Either a single language string applied to the whole batch or a list with the same length as ``audio``.
+        textnorm : str
+            Normalisation type expected by the model.
+        timestamps : bool
+            Whether to return word-level timestamps.
+
+        Returns
+        -------
+        List[OmniTranscription]
+            A list of transcriptions in the original order of ``audio``.
+        """
+        # Validate audio input
+        if not isinstance(audio, list) or not all(isinstance(a, np.ndarray) for a in audio):
+            raise ValueError("`audio` must be a list of numpy.ndarray, each containing a mono waveform.")
+
+        # Prepare language list
+        if isinstance(language, list):
+            assert len(language) == len(audio), "The length of `language` must match the length of `audio`."
+            languages = language
+        else:
+            languages = [language] * len(audio)
+
+        # Extract acoustic features for the entire batch
+        feats, feats_len = self.extract_feat(audio)
+
+        # Forward pass through the model
+        ctc_logits, encoder_out_lens = self.model.inference(
+            torch.from_numpy(feats).to(self.device),
+            torch.from_numpy(feats_len).to(self.device),
+            languages,
+            textnorm,
+        )
+
+        results: List[Union[str, OmniTranscription]] = [None] * len(audio)
+
+        if timestamps:
+            # The meta information is encoded in the first 4 frames
+            ctc_maxids = ctc_logits[:, :4].argmax(dim=-1)
+            for i in range(len(audio)):
+                token_int = ctc_maxids[i].tolist()
+                results[i] = OmniTranscription.parse(self.tokenizer.decode(token_int))
+
+            # Word-level greedy search for the remaining frames
+            utt_time_pairs, utt_words = ctc_greedy_search(
+                ctc_logits[:, 4:],
+                encoder_out_lens - 4,
+                sp=self.tokenizer.sp,
+                subsampling_factor=6,
+                frame_shift_ms=self.frontend.opts.frame_opts.frame_shift_ms,
+            )
+            for i, (time_pairs, words) in enumerate(zip(utt_time_pairs, utt_words)):
+                results[i] = results[i]._replace(
+                    words=[
+                        AlignmentItem(symbol=word, start=pair[0], duration=round(pair[1] - pair[0], ndigits=4))
+                        for pair, word in zip(time_pairs, words)
+                    ],
+                    text=" ".join(words),
+                )
+            return results
+
+        # Greedy decoding without timestamps
+        encoder_out_lens = encoder_out_lens.cpu().numpy().tolist()
+        ctc_maxids = ctc_logits.argmax(dim=-1)
+        for i in range(len(audio)):
+            yseq = ctc_maxids[i, : encoder_out_lens[i]]
+            yseq = torch.unique_consecutive(yseq, dim=-1)
+            mask = yseq != self.blank_id
+            token_int = yseq[mask].tolist()
+            results[i] = self.tokenizer.decode(token_int)
+
+        return [OmniTranscription.parse(r) for r in results]
+
+    @torch.no_grad()
     def transcribe(
         self,
         audio: Union[str, List[str], np.ndarray, List[np.ndarray], List[Cut]],
